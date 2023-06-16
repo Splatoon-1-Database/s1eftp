@@ -1,0 +1,9 @@
+[package]
+name = "s1edl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ftp = "3.0.1"
+walkdir = "2.3.3"
+downloader = "0.2.7"
