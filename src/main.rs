@@ -1,19 +1,62 @@
+use downloader::Downloader;
+use ftp::FtpStream;
 use std::collections::HashSet;
+use std::fs;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::BufRead;
 use std::io::Write;
-use std::fs;
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use downloader::Downloader;
-use ftp::FtpStream;
 
-const SPLATOON_EU_TITLE_ID: &str = "10176A00";
+const SPLATOON_EUR_TITLE_ID: &str = "10176A00";
 const SPLATOON_USA_TITLE_ID: &str = "10176900";
 const SPLATOON_JPN_TITLE_ID: &str = "10162B00";
 
-const NOHASH_GAMBIT_URL: &str = "https://raw.githubusercontent.com/Splatoon-1-Database/s1eftp/main/Gambit.rpx";
+const NOHASH_GAMBIT_URL: &str =
+    "https://raw.githubusercontent.com/Splatoon-1-Database/s1eftp/main/Gambit.rpx";
+
+trait PathBufExt {
+    fn offset(&self, offset: usize) -> PathBuf;
+}
+
+impl PathBufExt for PathBuf {
+    fn offset(&self, offset: usize) -> PathBuf {
+        let mut path_iter = self.components();
+
+        for _ in 0..offset {
+            path_iter.next();
+        }
+
+        path_iter.collect::<PathBuf>()
+    }
+}
+
+enum InstallStorage {
+    MLC,
+    USB,
+}
+
+impl InstallStorage {
+    fn path(&self) -> PathBuf {
+        let path = match self {
+            Self::MLC => "storage_mlc\\usr\\title\\0005000e",
+            Self::USB => "storage_usb\\usr\\title\\0005000e",
+        };
+        PathBuf::from_str(path).unwrap()
+    }
+}
+
+fn detect_region(title_id: &str) -> Option<String> {
+    let region = match title_id.to_uppercase().as_str() {
+        "10176A00" => "EUR",
+        "10176900" => "USA",
+        "10162B00" => "JPN",
+        _ => return None,
+    };
+    Some(region.into())
+}
 
 fn get_choice() -> u32 {
     let input_text = get_string();
@@ -30,42 +73,53 @@ fn get_string() -> String {
     let mut stdin = io::stdin().lock();
 
     let mut input_text = String::new();
-    stdin
-        .read_line(&mut input_text)
-        .unwrap();
+    stdin.read_line(&mut input_text).unwrap();
 
     input_text.trim().into()
 }
 
-fn wiiu_install_helper(title_ids: &Vec<String>, source_path: &Path, install_path: &Path, ftp_stream: &mut FtpStream) {
-    for title_id in title_ids {
-        let source_path_paths = walkdir::WalkDir::new(&source_path);
-        for path in source_path_paths {
-            let path = path.unwrap();
-            if path.path().is_dir() {
-                continue
-            }
-            let path_str = path.path().to_str().unwrap();
-            let mut path_str = path_str.replace("\\", "/");
+fn install_files(
+    title_id: &str,
+    mod_path: &Path,
+    storage_device: &InstallStorage,
+    ftp_stream: &mut FtpStream,
+) {
+    println!("Installing files...");
 
-            if source_path.ends_with("/") {
-                path_str.pop();
-            }
+    let offset = mod_path.components().count();
 
-            let path_trimmed = &path_str[
-                source_path.to_str().unwrap().len() + 1..];
+    let install_root = storage_device.path().join(title_id);
 
-            println!("Writing \"{path_trimmed}\"...", );
+    for mod_path_entry in walkdir::WalkDir::new(&mod_path) {
+        let mod_path_entry = mod_path_entry.unwrap();
+        let mod_path_entry_buf = mod_path_entry
+            .path()
+            .components()
+            .into_iter()
+            .collect::<PathBuf>();
+        let mod_path_entry_buf_cut = mod_path_entry_buf.offset(offset);
 
-            let mut file = fs::File::open(path.path()).unwrap();
+        let install_path = install_root.join(&mod_path_entry_buf_cut);
 
-            ftp_stream.put(&format!(
-                "{}/{}/{}",
-                install_path.to_str().unwrap(),
-                title_id,
-                path_trimmed,
-            ), &mut file).unwrap();
+        if install_path.extension().is_none() {
+            continue;
         }
+
+        println!("Writing \"{}\"...", mod_path_entry_buf_cut.display());
+
+        let mod_path = mod_path
+            .join(&mod_path_entry_buf_cut)
+            .iter()
+            .collect::<PathBuf>();
+
+        let mut file = fs::File::open(mod_path).unwrap();
+
+        ftp_stream
+            .put(
+                &install_path.to_str().unwrap().replace("\\", "/"),
+                &mut file,
+            )
+            .unwrap();
     }
 }
 
@@ -96,38 +150,92 @@ fn wiiu_setup() {
     let mut ftp_stream = FtpStream::connect(socket_address).unwrap();
     ftp_stream.login("", "").unwrap();
 
-    let splatoon_title_ids = HashSet::from([SPLATOON_EU_TITLE_ID, SPLATOON_USA_TITLE_ID, SPLATOON_JPN_TITLE_ID]);
+    let splatoon_title_ids = HashSet::from([
+        SPLATOON_EUR_TITLE_ID,
+        SPLATOON_USA_TITLE_ID,
+        SPLATOON_JPN_TITLE_ID,
+    ]);
 
     let mlc_path = Path::new("storage_mlc/usr/title/0005000e");
     let usb_path = Path::new("storage_usb/usr/title/0005000e");
 
     let mut installed_title_ids_mlc = ftp_stream.nlst(Some(mlc_path.to_str().unwrap())).unwrap();
-    installed_title_ids_mlc.retain(|title_id| {
-        splatoon_title_ids.contains(title_id.to_uppercase().as_str())
-    });
+    installed_title_ids_mlc
+        .retain(|title_id| splatoon_title_ids.contains(title_id.to_uppercase().as_str()));
 
     let mut installed_title_ids_usb = ftp_stream.nlst(Some(usb_path.to_str().unwrap())).unwrap();
-    installed_title_ids_usb.retain(|title_id| {
-        splatoon_title_ids.contains(title_id.to_uppercase().as_str())
-    });
+    installed_title_ids_usb
+        .retain(|title_id| splatoon_title_ids.contains(title_id.to_uppercase().as_str()));
 
     if installed_title_ids_mlc.is_empty() && installed_title_ids_usb.is_empty() {
         println!("Splatoon could not be detected.");
+        return;
     }
 
-    println!("Splatoon detected successfully. Please enter the FULL path to the extracted mod directory.");
+    let mut installed_splatoon_titles: Vec<(InstallStorage, String)> = vec![];
+
+    for title_id in &installed_title_ids_mlc {
+        if detect_region(&title_id).is_none() {
+            continue;
+        }
+        installed_splatoon_titles.push((InstallStorage::MLC, title_id.clone()));
+    }
+
+    for title_id in &installed_title_ids_usb {
+        if detect_region(&title_id).is_none() {
+            continue;
+        }
+        installed_splatoon_titles.push((InstallStorage::USB, title_id.clone()));
+    }
+
+    if installed_splatoon_titles.is_empty() {
+        println!("Splatoon could not be detected.");
+        return;
+    }
+
+    println!("Which Splatoon version would you like to install the mod to? (enter the corresponding number)");
+
+    for (i, title) in installed_splatoon_titles.iter().enumerate() {
+        let display_storage = match title.0 {
+            InstallStorage::MLC => "Console's Storage",
+            InstallStorage::USB => "USB Storage",
+        };
+        let region = detect_region(&title.1).unwrap();
+        println!("{i}. \"{region}\" Splatoon ({display_storage})",);
+    }
+
+    let choice = get_choice();
+
+    let target_title = &installed_splatoon_titles[choice as usize];
+
+    println!("Please enter the FULL path to the extracted mod directory.");
     println!("* The developer is not responsible for any damages causes by the files provided on the path.");
 
     let splatoon_mod_path = get_string();
     let splatoon_mod_path = Path::new(&splatoon_mod_path);
 
-    if !installed_title_ids_mlc.is_empty() {
-        wiiu_install_helper(&installed_title_ids_mlc, &splatoon_mod_path, mlc_path, &mut ftp_stream);
+    println!("Would you like to do a backup of the files of the selected Splatoon title before installing the mod? (1 for yes, 2 for no)");
+
+    let choice = get_choice();
+    if choice == 1 {
+        println!("Please enter the FULL path to the directory that should be used for the backup to your PC.");
+        let backup_path = get_string();
+        let backup_path = Path::new(&backup_path);
+        backup_files(
+            &target_title.1,
+            splatoon_mod_path,
+            &target_title.0,
+            backup_path,
+            &mut ftp_stream,
+        );
     }
 
-    if !installed_title_ids_usb.is_empty() {
-        wiiu_install_helper(&installed_title_ids_usb, &splatoon_mod_path, usb_path, &mut ftp_stream);
-    }
+    install_files(
+        &target_title.1,
+        splatoon_mod_path,
+        &target_title.0,
+        &mut ftp_stream,
+    );
 
     println!("Would you like to install No-Hash to prevent disconnects caused by the mod? (1 for yes, 2 for no)");
     println!("* Using mods in matches on Nintendo Network without some form of No-Hash will get you instantly banned.");
@@ -135,24 +243,19 @@ fn wiiu_setup() {
     let choice = get_choice();
 
     match choice {
-        1 => {},
-        2 => return,
-        _ => {
-            println!("Invalid choice");
-            return
-        },
+        1 => {}
+        _ => return,
     }
 
     let nohash_download_path = download_nohash();
     let nohash_download_path = nohash_download_path.as_path();
 
-    if !installed_title_ids_mlc.is_empty() {
-        wiiu_install_helper(&installed_title_ids_mlc, nohash_download_path, mlc_path, &mut ftp_stream);
-    }
-
-    if !installed_title_ids_usb.is_empty() {
-        wiiu_install_helper(&installed_title_ids_usb, nohash_download_path, usb_path, &mut ftp_stream);
-    }
+    install_files(
+        &target_title.1,
+        nohash_download_path,
+        &target_title.0,
+        &mut ftp_stream,
+    );
 
     ftp_stream.quit().unwrap();
 }
@@ -183,6 +286,68 @@ fn download_nohash() -> PathBuf {
     download_root
 }
 
+fn backup_files(
+    title_id: &str,
+    mod_path: &Path,
+    storage_device: &InstallStorage,
+    backup_path: &Path,
+    ftp_stream: &mut FtpStream,
+) {
+    println!("Backing up files...");
+
+    let game_region = detect_region(title_id).unwrap();
+
+    let offset = mod_path.components().count();
+
+    let source_root = storage_device.path().join(title_id);
+
+    for mod_path_entry in walkdir::WalkDir::new(&mod_path) {
+        let mod_path_entry = mod_path_entry.unwrap();
+        let mod_path_entry_buf = mod_path_entry
+            .path()
+            .components()
+            .into_iter()
+            .collect::<PathBuf>();
+        let mod_path_entry_buf_cut = mod_path_entry_buf.offset(offset);
+
+        let source_path = source_root.join(&mod_path_entry_buf_cut);
+
+        if source_path.extension().is_none() {
+            continue;
+        }
+
+        let Ok(cursor) = ftp_stream.simple_retr(&source_path.to_str().unwrap().replace("\\", "/")) else {
+                println!("Backing up file \"{game_region}\" from Splatoon failed. Would you like to continue backing up? (1 for yes, 2 for no)");
+                let choice = get_choice();
+                match choice {
+                    1 => continue,
+                    _ => break,
+                };
+            };
+
+        let backup_path = backup_path
+            .join(&mod_path_entry_buf_cut)
+            .iter()
+            .collect::<PathBuf>();
+
+        let mut backup_path_temp = backup_path.clone();
+        backup_path_temp.pop();
+
+        fs::create_dir_all(backup_path_temp).unwrap();
+
+        println!("Writing \"{}\"...", mod_path_entry_buf_cut.display());
+
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .append(false)
+            .open(backup_path)
+            .unwrap();
+
+        file.write_all(cursor.into_inner().as_slice()).unwrap();
+    }
+}
+
 fn cemu_setup() {
     println!("Cemu support not yet implemented.");
 }
@@ -197,7 +362,6 @@ fn main() {
 
     match choice {
         1 => wiiu_setup(),
-        2 => cemu_setup(),
-        _ => println!("Invalid choice"),
+        _ => cemu_setup(),
     }
 }
